@@ -121,12 +121,30 @@ actor QuotaClient {
     private var cachedEmail: String?
     private var cachedProject: String?
 
-    private let session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 20
-        return URLSession(configuration: config)
-    }()
+    /// A fresh ephemeral session per request. Reusing one session keeps an idle keep-alive
+    /// connection to the (local) proxy between 60s polls; when the proxy has silently closed it,
+    /// the next request fails with NSURLErrorCannotParseResponse (-1017). One transient retry
+    /// is kept as a safety net.
+    private func send(_ req: URLRequest) async throws -> (Data, URLResponse) {
+        var lastError: Error?
+        for attempt in 0..<2 {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = 15
+            config.timeoutIntervalForResource = 20
+            let session = URLSession(configuration: config)
+            defer { session.finishTasksAndInvalidate() }
+            do {
+                return try await session.data(for: req)
+            } catch let err as URLError
+                where attempt == 0 && (err.code == .cannotParseResponse
+                                       || err.code == .networkConnectionLost
+                                       || err.code == .secureConnectionFailed) {
+                lastError = err
+                continue
+            }
+        }
+        throw lastError ?? QuotaError.network("请求失败")
+    }
 
     func fetchQuota() async throws -> QuotaSnapshot {
         let token = try await validAccessToken(forceRefresh: false)
@@ -149,7 +167,7 @@ actor QuotaClient {
         req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["project": project])
 
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await send(req)
         guard let http = resp as? HTTPURLResponse else {
             throw QuotaError.network("无效响应")
         }
@@ -206,7 +224,7 @@ actor QuotaClient {
         req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["metadata": ["ideType": "ANTIGRAVITY"]])
 
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await send(req)
         if let http = resp as? HTTPURLResponse {
             if http.statusCode == 401 { throw QuotaError.unauthorized }
             if (200..<300).contains(http.statusCode),
@@ -267,7 +285,7 @@ actor QuotaClient {
         ]
         req.httpBody = comps.percentEncodedQuery?.data(using: .utf8)
 
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await send(req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
             return .failure(code, String(data: data, encoding: .utf8) ?? "")
